@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.15;
 
-import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
-import { SafeCall } from "../libraries/SafeCall.sol";
-import { L2OutputOracle } from "./L2OutputOracle.sol";
-import { SystemConfig } from "./SystemConfig.sol";
-import { Constants } from "../libraries/Constants.sol";
-import { Types } from "../libraries/Types.sol";
-import { Hashing } from "../libraries/Hashing.sol";
-import { SecureMerkleTrie } from "../libraries/trie/SecureMerkleTrie.sol";
-import { AddressAliasHelper } from "../vendor/AddressAliasHelper.sol";
-import { ResourceMetering } from "./ResourceMetering.sol";
-import { Semver } from "../universal/Semver.sol";
+import {Initializable} from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import {SafeCall} from "../libraries/SafeCall.sol";
+import {L2OutputOracle} from "./L2OutputOracle.sol";
+import {Constants} from "../libraries/Constants.sol";
+import {Types} from "../libraries/Types.sol";
+import {Hashing} from "../libraries/Hashing.sol";
+import {SecureMerkleTrie} from "../libraries/trie/SecureMerkleTrie.sol";
+import {AddressAliasHelper} from "../vendor/AddressAliasHelper.sol";
+import {ResourceMetering} from "./ResourceMetering.sol";
+import {Semver} from "../universal/Semver.sol";
+import {StakingFee} from "./StakingFee.sol";
+import "./IDepositContract.sol";
 
 /**
  * @custom:proxied
@@ -45,14 +46,9 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
     uint64 internal constant RECEIVE_DEFAULT_GAS_LIMIT = 100_000;
 
     /**
-     * @notice Address of the L2OutputOracle contract.
+     * @notice Address of the L2OutputOracle.
      */
     L2OutputOracle public immutable L2_ORACLE;
-
-    /**
-     * @notice Address of the SystemConfig contract.
-     */
-    SystemConfig public immutable SYSTEM_CONFIG;
 
     /**
      * @notice Address that has the ability to pause and unpause withdrawals.
@@ -66,6 +62,10 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
      */
     address public l2Sender;
 
+    StakingFee public stakingFee;
+    IDepositContract public DepositContract;
+    address public depositor;
+
     /**
      * @notice A list of withdrawal hashes which have been successfully finalized.
      */
@@ -78,7 +78,8 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
 
     /**
      * @notice Determines if cross domain messaging is paused. When set to true,
-     *         withdrawals are paused. This may be removed in the future.
+     *         deposits and withdrawals are paused. This may be removed in the
+     *         future.
      */
     bool public paused;
 
@@ -109,6 +110,7 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
         address indexed to
     );
 
+    event PubKeyDeposited(bytes pubkey);
     /**
      * @notice Emitted when a withdrawal transaction is finalized.
      *
@@ -140,22 +142,19 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
     }
 
     /**
-     * @custom:semver 1.6.0
+     * @custom:semver 1.2.0
      *
      * @param _l2Oracle                  Address of the L2OutputOracle contract.
      * @param _guardian                  Address that can pause deposits and withdrawals.
      * @param _paused                    Sets the contract's pausability state.
-     * @param _config                    Address of the SystemConfig contract.
      */
     constructor(
         L2OutputOracle _l2Oracle,
         address _guardian,
-        bool _paused,
-        SystemConfig _config
-    ) Semver(1, 6, 0) {
+        bool _paused
+    ) Semver(1, 2, 0) {
         L2_ORACLE = _l2Oracle;
         GUARDIAN = _guardian;
-        SYSTEM_CONFIG = _config;
         initialize(_paused);
     }
 
@@ -166,6 +165,21 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
         l2Sender = Constants.DEFAULT_L2_SENDER;
         paused = _paused;
         __ResourceMetering_init();
+    }
+
+    function setStakingFee(StakingFee _stakingFee) external {
+        require(msg.sender == GUARDIAN, "OptimismPortal: only guardian can set");
+        stakingFee = _stakingFee;
+    }
+
+    function keyDepositor(address _depositAddress) external {
+        require(msg.sender == GUARDIAN, "OptimismPortal: only guardian can set");
+        depositor = _depositAddress;
+    }
+
+    function setDepositContract(IDepositContract _deposit) external {
+        require(msg.sender == GUARDIAN, "OptimismPortal: only guardian can set");
+        DepositContract = _deposit;
     }
 
     /**
@@ -187,17 +201,6 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
     }
 
     /**
-     * @notice Computes the minimum gas limit for a deposit. The minimum gas limit
-     *         linearly increases based on the size of the calldata. This is to prevent
-     *         users from creating L2 resource usage without paying for it. This function
-     *         can be used when interacting with the portal to ensure forwards compatibility.
-     *
-     */
-    function minimumGasLimit(uint64 _byteCount) public pure returns (uint64) {
-        return _byteCount * 16 + 21000;
-    }
-
-    /**
      * @notice Accepts value so that users can send ETH directly to this contract and have the
      *         funds be deposited to their address on L2. This is intended as a convenience
      *         function for EOAs. Contracts should call the depositTransaction() function directly
@@ -214,21 +217,6 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
      */
     function donateETH() external payable {
         // Intentionally empty.
-    }
-
-    /**
-     * @notice Getter for the resource config. Used internally by the ResourceMetering
-     *         contract. The SystemConfig is the source of truth for the resource config.
-     *
-     * @return ResourceMetering.ResourceConfig
-     */
-    function _resourceConfig()
-        internal
-        view
-        override
-        returns (ResourceMetering.ResourceConfig memory)
-    {
-        return SYSTEM_CONFIG.resourceConfig();
     }
 
     /**
@@ -275,8 +263,8 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
         // output index has been updated.
         require(
             provenWithdrawal.timestamp == 0 ||
-                L2_ORACLE.getL2Output(provenWithdrawal.l2OutputIndex).outputRoot !=
-                provenWithdrawal.outputRoot,
+            L2_ORACLE.getL2Output(provenWithdrawal.l2OutputIndex).outputRoot !=
+            provenWithdrawal.outputRoot,
             "OptimismPortal: withdrawal hash has already been proven"
         );
 
@@ -308,9 +296,9 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
         // `l2BlockNumber` in the `provenWithdrawals` mapping. A `withdrawalHash` can only be
         // proven once unless it is submitted again with a different outputRoot.
         provenWithdrawals[withdrawalHash] = ProvenWithdrawal({
-            outputRoot: outputRoot,
-            timestamp: uint128(block.timestamp),
-            l2OutputIndex: uint128(_l2OutputIndex)
+        outputRoot : outputRoot,
+        timestamp : uint128(block.timestamp),
+        l2OutputIndex : uint128(_l2OutputIndex)
         });
 
         // Emit a `WithdrawalProven` event.
@@ -323,8 +311,8 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
      * @param _tx Withdrawal transaction to finalize.
      */
     function finalizeWithdrawalTransaction(Types.WithdrawalTransaction memory _tx)
-        external
-        whenNotPaused
+    external
+    whenNotPaused
     {
         // Make sure that the l2Sender has not yet been set. The l2Sender is set to a value other
         // than the default value when a withdrawal transaction is being finalized. This check is
@@ -399,9 +387,11 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
         // SafeCall.callWithMinGas to ensure two key properties
         //   1. Target contracts cannot force this call to run out of gas by returning a very large
         //      amount of data (and this is OK because we don't care about the returndata here).
-        //   2. The amount of gas provided to the execution context of the target is at least the
-        //      gas limit specified by the user. If there is not enough gas in the current context
-        //      to accomplish this, `callWithMinGas` will revert.
+        //   2. The amount of gas provided to the call to the target contract is at least the gas
+        //      limit specified by the user. If there is not enough gas in the callframe to
+        //      accomplish this, `callWithMinGas` will revert.
+        // Additionally, if there is not enough gas remaining to complete the execution after the
+        // call returns, this function will revert.
         bool success = SafeCall.callWithMinGas(_tx.target, _tx.gasLimit, _tx.value, _tx.data);
 
         // Reset the l2Sender back to the default value.
@@ -446,19 +436,10 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
                 "OptimismPortal: must send to address(0) when creating a contract"
             );
         }
-
-        // Prevent depositing transactions that have too small of a gas limit. Users should pay
-        // more for more resource usage.
-        require(
-            _gasLimit >= minimumGasLimit(uint64(_data.length)),
-            "OptimismPortal: gas limit too small"
-        );
-
-        // Prevent the creation of deposit transactions that have too much calldata. This gives an
-        // upper limit on the size of unsafe blocks over the p2p network. 120kb is chosen to ensure
-        // that the transaction can fit into the p2p network policy of 128kb even though deposit
-        // transactions are not gossipped over the p2p network.
-        require(_data.length <= 120_000, "OptimismPortal: data too large");
+        // Prevent depositing transactions that have too small of a gas limit.
+        require(_gasLimit >= 21_000, "OptimismPortal: gas limit must cover instrinsic gas cost");
+        uint ethToMint = uint256((msg.value*1e18) / stakingFee.getPrice());
+        stakingFee.updateDeposit(msg.value, ethToMint);
 
         // Transform the from-address to its alias if the caller is a contract.
         address from = msg.sender;
@@ -470,8 +451,8 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
         // We use opaque data so that we can update the TransactionDeposited event in the future
         // without breaking the current interface.
         bytes memory opaqueData = abi.encodePacked(
-            msg.value,
-            _value,
+            ethToMint,
+            ethToMint,
             _gasLimit,
             _isCreation,
             _data
@@ -480,6 +461,25 @@ contract OptimismPortal is Initializable, ResourceMetering, Semver {
         // Emit a TransactionDeposited event so that the rollup node can derive a deposit
         // transaction for this deposit.
         emit TransactionDeposited(from, _to, DEPOSIT_VERSION, opaqueData);
+    }
+
+    function depositValidator(
+        bytes calldata _pubkey,
+        bytes calldata _withdrawal_credentials,
+        bytes calldata _signature,
+        bytes32 _deposit_data_root
+    ) external {
+        require(msg.sender == depositor, "Sender not permitted to deposit key");
+        // Deposit the validator to the deposit contract
+        DepositContract.deposit{value : 32e18}(
+            _pubkey,
+            _withdrawal_credentials,
+            _signature,
+            _deposit_data_root
+        );
+        stakingFee.addDepositValidator(_pubkey);
+        // Emit an event to log the deposit of the public key
+        emit PubKeyDeposited(_pubkey);
     }
 
     /**
